@@ -1,0 +1,517 @@
+AWSTemplateFormatVersion: 2010-09-09
+
+Description: |
+  Load Balancer template deploys:
+    - Application Load Balancer (ALB) including listener, listener rules and
+      target group
+    - Security Groups for ALB listener and to allow access to EC2 instances
+    - CloudWatch alarms for ALB
+
+Parameters:
+
+  ##########################################################################
+  # App naming/tagging parameters
+  ##########################################################################
+  AppName:
+    Description: >
+      Application/Environment name that will be used in resource names/tags and
+      Must be unique per region. Please do not use upper case letters.
+    Type: String
+    MinLength: 2
+    AllowedPattern: '(?:[a-z0-9]+(?:[._-][a-z0-9]+)*/)*[a-z0-9]+(?:[._-][a-z0-9]+)*'
+
+  AppTier:
+    Description: App tier
+    Type: String
+    Default: web
+    AllowedValues:
+      - public
+      - web
+      - application
+      - database
+
+  SDLCEnv:
+    Description: SDLC environment
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - test
+      - uat
+      - prod
+
+  StackNum:
+    Description: >
+      CF Stack number used when having multiple instances of the same stack
+    Type: Number
+    Default: 1
+
+  BusinessUnit:
+    Description: >
+      BusinessUnits used for billing. Delimit multiple values with a colon
+    Type: String
+
+  ##########################################################################
+  # Application Load Balancer Parameters
+  ##########################################################################
+  AlbScheme:
+    Description: Specifies whether the load balancer is internal or Internet-facing
+    Type: String
+    Default: internal
+    AllowedValues:
+      - internet-facing
+      - internal
+    ConstraintDescription: Must be a supported load balancer scheme
+
+  AlbAccessLogsBucket:
+    Description: S3 bucket where the load balancer logs are stored
+    Type: String
+
+  AlbAccessLogsPrefix:
+    Description: >
+      S3 prefix under AlbAccessLogsBucket for the access logs.
+      Cannot start or end with '/'. Can be empty
+    Type: String
+    AllowedPattern: '(^[^/].*[/]$|^$)'
+    ConstraintDescription: Cannot start or end with '/'. Can be empty
+
+  ShouldAddAlbBucketLogsPolicy:
+    Description: >
+      Controls whether to set a bucket policy to allow the Load Balancer
+      service to write access logs in the log bucket: AlbAccessLogsBucket.
+      If set to false, the bucket must be pre-configured with the right
+      permissions.
+    Type: String
+    Default: true
+    AllowedValues:
+      - true
+      - false
+
+  ##########################################################################
+  # Application Load Balancer Listener Parameters
+  ##########################################################################
+  AlbListenerPort:
+    Description: Load balancer listener port
+    Type: Number
+    Default: 443
+
+  AlbListenerProtocol:
+    Description: Load Balancer listener protocol
+    Type: String
+    Default: HTTPS
+    AllowedValues:
+      - TCP
+      - HTTP
+      - HTTPS
+      - SSL
+    ConstraintDescription: Must be a supported listener protocol
+
+  # https://docs.aws.amazon.com/elasticloadbalancing/latest/application/create-https-listener.html#describe-ssl-policies
+  AlbSslPolicy:
+    Description: Load balancer SSL/TLS policy of listener
+    Type: String
+    Default: ELBSecurityPolicy-TLS-1-2-2017-01
+    ConstraintDescription: Must be a valid SSL/TLS Policy defined by AWS
+
+  AlbCertificateArn:
+    Description: ACM certificate ARN to use with loadbalancer HTTPS
+    Type: String
+    AllowedPattern: '(^$|^arn:aws:acm:[-a-z0-9]+:[0-9]{12}:certificate/[-0-9a-f]+$)'
+    ConstraintDescription: Must be a valid ACM ARN
+
+  # TODO change to comma separated list of private addresses unless internal public (VPN)
+  AlbCidrBlock:
+    Description: >
+      CIDR block allowed to make requests to Application Load Balancer.
+      Open to the world by default.
+    Type: String
+    AllowedPattern: '((\d{1,3})\.){3}\d{1,3}/\d{1,2}'
+    Default: 0.0.0.0/0
+    ConstraintDescription: Must be a valid IPv4 CIDR
+
+  AlbTargetGroupProtocol:
+    Description: ELB target group protocol
+    Type: String
+    # TODO change default to HTTPS once server has certs
+    Default: HTTP
+    AllowedValues:
+      - HTTP
+      - HTTPS
+    ConstraintDescription: Must be a supported target group protocol
+
+  ##########################################################################
+  # Application Load Balancer Target Group Parameters
+  ##########################################################################
+  AppPort:
+    Description: Application listener port
+    Type: Number
+    Default: 8080
+
+  AlbHealthCheckIntervalSeconds:
+    Description: Interval of ALB healthchecks for TargetGroup
+    Type: Number
+    Default: 20
+
+  AlbHealthCheckTimeoutSeconds:
+    Description: Allowed timeout value in seconds for AlbHealthCheck
+    Type: Number
+    Default: 5
+
+  AlbHealthyThresholdCount:
+    Description: AlbHealthCheck cycles to define healthy status
+    Type: Number
+    Default: 2
+
+  AlbHealthCheckPath:
+    Description: ALB Health check path for HTTP checks
+    Type: String
+    Default: /
+
+  AlbUnhealthyThresholdCount:
+    Description: AlbHealthCheck UnhealthyThreshold
+    Type: Number
+    Default: 3
+
+  ##########################################################################
+  # Network Parameters
+  ##########################################################################
+  VpcId:
+    Description: The VPC to deploy the load balancer
+    Type: AWS::EC2::VPC::Id
+
+  LoadBalancerSubnets:
+    Description: >
+      Subnets used by the load balancer. Select two private subnets in
+      two different availability zones within the VPC.
+    Type: List<AWS::EC2::Subnet::Id>
+
+  ##########################################################################
+  # Monitoring / Alarm Parameters
+  ##########################################################################
+  AppMinInstanceCount:
+    Description: Minimum number of healthy EC2 instances for alarm
+    Type: Number
+    Default: 2
+
+  ##########################################################################
+  # Stack Names used to import values
+  ##########################################################################
+  SnSNotificationsStackName:
+    Description: >
+      Name of the notifications topic stack that exports the value
+      of the SNS topic ARN
+    Type: String
+    MinLength: 2
+
+Conditions:
+
+  ShouldAddAlbBucketLogsPolicy:
+    !Equals
+      - !Ref ShouldAddAlbBucketLogsPolicy
+      - true
+
+  IsAlbAccessLogsBucketEmpty:
+    !Equals
+      - !Ref AlbAccessLogsPrefix
+      - ""
+
+Mappings:
+
+  # https://docs.aws.amazon.com/elasticloadbalancing/latest/application/load-balancer-access-logs.html#access-logging-bucket-permissions
+  ElbAccessLogRegionMap:
+    us-east-1:
+      AccountId: 127311923021
+    us-east-2:
+      AccountId: 033677994240
+    us-west-1:
+      AccountId: 027434742980
+    us-west-2:
+      AccountId: 797873946194
+
+Resources:
+
+  ##########################################################################
+  # Security groups
+  ##########################################################################
+
+  # This security group controls incoming connections to the load balancer
+  # https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-template-resource-type-ref.html
+  LoadBalancerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      VpcId: !Ref VpcId
+      GroupDescription: !Sub "Access to the load balancer that sits in front of: ${AppName}-${SDLCEnv}-${AppTier}-${StackNum}"
+      SecurityGroupIngress:
+        - CidrIp: !Ref AlbCidrBlock
+          Description: Incoming load balancer listener port
+          IpProtocol: TCP
+          FromPort: !Ref AlbListenerPort
+          ToPort: !Ref AlbListenerPort
+      SecurityGroupEgress:
+        - DestinationSecurityGroupId: !GetAtt AppToAlbSecurityGroup.GroupId
+          Description: Outgoing load balancer to service
+          IpProtocol: TCP
+          FromPort: !Ref AppPort
+          ToPort: !Ref AppPort
+      Tags:
+        - Key: Name
+          Value: !Sub "${AppName}-${SDLCEnv}-${AppTier}-${StackNum}-LoadBalancerSg"
+
+  # This security group is used to allow traffic between the load balancer and
+  # the EC2 instances
+  AppToAlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      VpcId: !Ref VpcId
+      GroupDescription: !Sub "Access between the load balancer and EC2 instances of: ${AppName}-${SDLCEnv}-${AppTier}-${StackNum}"
+      Tags:
+        - Key: Name
+          Value: !Sub "${AppName}-${SDLCEnv}-${AppTier}-${StackNum}-AppToAlbSg"
+
+  # adds a ingress self-referencing rule to AppToAlbSecurityGroup
+  AppToAlbSelfIngressRule:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref AppToAlbSecurityGroup
+      Description: !Sub "Self reference ingress rule to allow traffic between load balancer and EC2 instances of: ${AppName}-${SDLCEnv}-${AppTier}-${StackNum}"
+      SourceSecurityGroupId: !GetAtt LoadBalancerSecurityGroup.GroupId
+      IpProtocol: TCP
+      FromPort: !Ref AppPort
+      ToPort: !Ref AppPort
+
+  # adds a egress self-referencing rule to AppToAlbSecurityGroup
+  AppToAlbSelfEgressRule:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref AppToAlbSecurityGroup
+      Description: !Sub "Self reference egress rule to allow service access between EC2 instances of: ${AppName}-${SDLCEnv}-${AppTier}-${StackNum}"
+      DestinationSecurityGroupId: !GetAtt AppToAlbSecurityGroup.GroupId
+      IpProtocol: TCP
+      FromPort: !Ref AppPort
+      ToPort: !Ref AppPort
+
+  # https://docs.aws.amazon.com/elasticloadbalancing/latest/application/load-balancer-access-logs.html#access-logging-bucket-permissions
+  # Used to grant the ELB service permissions to write access logs in an S3 bucket
+  AccessLogsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Condition: ShouldAddAlbBucketLogsPolicy
+    Properties:
+      Bucket: !Ref AlbAccessLogsBucket
+      PolicyDocument:
+        Version: 2012-10-17
+        Id: AlbAccessLogs
+        Statement:
+          - Effect: Allow
+            Action:
+              - s3:PutObject
+            Principal:
+              AWS:
+                - !FindInMap [ ElbAccessLogRegionMap, !Ref "AWS::Region", AccountId ]
+            Resource: !Sub "arn:aws:s3:::${AlbAccessLogsBucket}${AlbAccessLogsPrefix}/AWSLogs/${AWS::AccountId}/*"
+
+  ##########################################################################
+  # Load balancer
+  ##########################################################################
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    DependsOn:
+      - AccessLogsBucketPolicy
+    Properties:
+      Scheme: !Ref AlbScheme
+      Name: !Sub "${AppName}-${SDLCEnv}-${AppTier}-${StackNum}"
+      LoadBalancerAttributes:
+        - Key: idle_timeout.timeout_seconds
+          Value: 30
+        # TODO setup access logs bucket with permissions
+        # https://docs.aws.amazon.com/elasticloadbalancing/latest/application/load-balancer-access-logs.html
+        - Key: access_logs.s3.enabled
+          Value: true
+        - Key: access_logs.s3.bucket
+          Value: !Ref AlbAccessLogsBucket
+        - !If
+          - IsAlbAccessLogsBucketEmpty
+          - !Ref AWS::NoValue
+          - Key: access_logs.s3.prefix
+            Value: !Ref AlbAccessLogsPrefix
+      Subnets: !Ref LoadBalancerSubnets
+      SecurityGroups:
+        - !Ref LoadBalancerSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub "${AppName}-${SDLCEnv}-${AppTier}-${StackNum}-LoadBalancer"
+        # TODO add required tags
+        # https://confluence.ecmc.org/display/TAOPv002/Tagging+Runbook
+        - Key: Environment
+          Value: !Sub "${SDLCEnv}"
+        - Key: Application
+          Value: !Sub "${AppName}"
+        - Key: BusinessUnit
+          Value: !Sub "${BusinessUnit}"
+
+  LoadBalancerListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: !Ref AlbListenerPort
+      Protocol: !Ref AlbListenerProtocol
+      Certificates:
+        - CertificateArn: !Ref AlbCertificateArn
+      SslPolicy: !Ref AlbSslPolicy
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref LoadBalancerTargetGroup
+
+  LoadBalancerListenerRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !Ref LoadBalancerListener
+      Priority: 1
+      Conditions:
+        - Field: path-pattern
+          Values:
+            - '*'
+      Actions:
+        - TargetGroupArn: !Ref LoadBalancerTargetGroup
+          Type: forward
+
+  LoadBalancerTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      HealthCheckIntervalSeconds: !Ref AlbHealthCheckIntervalSeconds
+      HealthCheckPath: !Ref AlbHealthCheckPath
+      HealthCheckPort: !Ref AppPort
+      HealthCheckProtocol: !Ref AlbTargetGroupProtocol
+      HealthCheckTimeoutSeconds: !Ref AlbHealthCheckTimeoutSeconds
+      HealthyThresholdCount: !Ref AlbHealthyThresholdCount
+      Matcher:
+        HttpCode: 200-299
+      Port: !Ref AppPort
+      Protocol: !Ref AlbTargetGroupProtocol
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: 30
+        - Key: stickiness.enabled
+          Value: true
+        - Key: stickiness.lb_cookie.duration_seconds
+          Value: 1800
+        - Key: stickiness.type
+          Value: lb_cookie
+      UnhealthyThresholdCount: !Ref AlbUnhealthyThresholdCount
+      VpcId: !Ref VpcId
+      Tags:
+        - Key: Name
+          Value: !Sub "${AppName}-${SDLCEnv}-${AppTier}-${StackNum}"
+
+  ##########################################################################
+  # Alarm
+  ##########################################################################
+
+  # Common CloudWatch alerts are created and configured to send alerts to the SNS topic
+  HealthyInstanceOKAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName:
+        !Sub "${AppName}-${SDLCEnv}-${AppTier}-${StackNum}-MinInstances"
+      AlarmDescription: Minimum number of instances met
+      AlarmActions:
+        - Fn::ImportValue: !Sub "${SnSNotificationsStackName}-NotificationsSnsTopicArn"
+      MetricName: HealthyHostCount
+      Namespace: AWS/ELB
+      Statistic: Average
+      Period: 60
+      EvaluationPeriods: 3
+      Threshold: !Ref AppMinInstanceCount
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: !Sub "${AppName}-${SDLCEnv}-${AppTier}-${StackNum}"
+          Value:
+            !Ref LoadBalancer
+
+  BackendConnectionErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName:
+        !Sub "${AppName}-${SDLCEnv}-${AppTier}-${StackNum}-BackendErrors"
+      AlarmDescription: Load balancer alarm for backend connection errors
+      AlarmActions:
+        - Fn::ImportValue: !Sub "${SnSNotificationsStackName}-NotificationsSnsTopicArn"
+      MetricName: BackendConnectionErrors
+      Namespace: AWS/ELB
+      Statistic: Average
+      Period: 60
+      EvaluationPeriods: 3
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: !Sub "${AppName}-${SDLCEnv}-${AppTier}-${StackNum}"
+          Value:
+            !Ref LoadBalancer
+
+  SurgeQueueLengthAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName:
+        !Sub "${AppName}-${SDLCEnv}-${AppTier}-${StackNum}-SurgeQueueLength"
+      AlarmDescription: Excessive queue length detected for load balancer
+      AlarmActions:
+        - Fn::ImportValue: !Sub "${SnSNotificationsStackName}-NotificationsSnsTopicArn"
+      MetricName: SurgeQueueLength
+      Namespace: AWS/ELB
+      Statistic: Average
+      Period: 60
+      EvaluationPeriods: 3
+      Threshold: 10
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: !Sub "${AppName}-${SDLCEnv}-${AppTier}-${StackNum}"
+          Value:
+            !Ref LoadBalancer
+
+  RejectedRequestsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName:
+        !Sub "${AppName}-${SDLCEnv}-${AppTier}-${StackNum}-RejectedReqs"
+      AlarmDescription: Rejected requests detected from load balancer
+      AlarmActions:
+        - Fn::ImportValue: !Sub "${SnSNotificationsStackName}-NotificationsSnsTopicArn"
+      MetricName: Latency
+      Namespace: AWS/ELB
+      Statistic: Average
+      Period: 60
+      EvaluationPeriods: 3
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: !Sub "${AppName}-${SDLCEnv}-${AppTier}-${StackNum}"
+          Value:
+            !Ref LoadBalancer
+
+# These are the template outputs. They are visible via the AWS Console and CLI.
+# They can also be referenced programmatically from a parent templates
+# Or use Exports to pass values to other stacks
+Outputs:
+
+  AppToLbSecurityGroupId:
+    Description: Load Balancer to EC2 Security Group
+    Value: !GetAtt AppToAlbSecurityGroup.GroupId
+    Export:
+      Name: !Sub "${AWS::StackName}-AppToAlbSecurityGroup"
+
+  LoadBalancerTargetGroupArn:
+    Description: ARN of ALB target group
+    Value: !Ref LoadBalancerTargetGroup
+    Export:
+      Name: !Sub "${AWS::StackName}-LoadBalancerTargetGroupArn"
+
+  LoadBalancerConsoleLink:
+    Description: Link to load balancer in AWS Console
+    Value: !Sub "https://console.aws.amazon.com/ec2/v2/home?region=${AWS::Region}#LoadBalancers:search=${LoadBalancer.LoadBalancerName}"
+
+  TargetGroupConsoleLink:
+    Description: Link to target group in AWS Console
+    Value: !Sub "https://console.aws.amazon.com/ec2/v2/home?region=${AWS::Region}#TargetGroups:search=${LoadBalancerTargetGroup.TargetGroupName}"
+
+  StackName:
+    Description: Stack name used to import values from other stacks
+    Value: !Ref AWS::StackName
