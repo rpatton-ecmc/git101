@@ -1,5 +1,9 @@
 AWSTemplateFormatVersion: 2010-09-09
 
+#
+# Generic template for deploying an Application Load Balancer
+#
+
 Description: |
   Load Balancer template deploys:
     - Application Load Balancer (ALB) including listener, listener rules and
